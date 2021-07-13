@@ -89,6 +89,7 @@ set(VEC_FILES
   functions/comparison_greater.cpp
   functions/function.cpp
   functions/function_helpers.cpp
+  functions/function_hash.cpp
   functions/functions_logical.cpp
   functions/function_cast.cpp
   functions/function_string.cpp

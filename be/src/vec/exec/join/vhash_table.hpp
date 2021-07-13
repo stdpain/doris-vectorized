@@ -2,6 +2,7 @@
 #include "vec/columns/column.h"
 #include "vec/columns/columns_number.h"
 #include "vec/common/assert_cast.h"
+#include "vec/data_types/data_type.h"
 
 namespace doris::vectorized {
 // now don't support StringValue
@@ -9,6 +10,15 @@ struct VectorizedHashTable {
     VectorizedHashTable() : counter(0) {}
     ~VectorizedHashTable() = default;
 
+    void init_values(DataTypes&& data_types) {
+        values.reserve(data_types.size());
+        for (const auto& type : data_types) {
+            values.emplace_back(type->create_column());
+        }
+        _data_types = std::move(data_types);
+    }
+
+    // before call insert reserve size must be called
     template <class GroupIdV, class BucketV>
     void insert(GroupIdV& groupIdV, BucketV& bucketV, int n) {
         reserve_size(counter + n);
@@ -45,21 +55,12 @@ struct VectorizedHashTable {
     Vec first;
     Vec next;
     MutableColumns values;
-    DataTypes data_types;
+    DataTypes _data_types;
 
 private:
     void _reserve_size(size_t sz) {
         first.resize(sz);
         next.resize(sz);
-        size_t column_size = data_types.size();
-        for (size_t i = 0; i < column_size; ++i) {
-            WhichDataType which(data_types[i]);
-            if (which.is_int32()) {
-                assert_cast<ColumnInt32*>(values[i].get())->get_data().resize(sz);
-            } else {
-                LOG(FATAL) << "not support datatype:" << int(which.idx);
-            }
-        }
     }
 
     static inline size_t round_up_to_power_of_two(size_t v) {

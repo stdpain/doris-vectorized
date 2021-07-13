@@ -2,6 +2,7 @@
 #include "common/object_pool.h"
 #include "exec/exec_node.h"
 #include "vec/exec/join/vhash_table.hpp"
+#include "vec/functions/function.h"
 
 namespace doris {
 namespace vectorized {
@@ -50,6 +51,19 @@ private:
 
     bool _build_unique;
     size_t _build_tuple_size;
+
+    VectorizedHashTable _hash_table;
+
+    using GroupIdV = std::vector<size_t>;
+    using BucketV = std::vector<size_t>;
+
+    GroupIdV _group_id_vec;
+    BucketV _bucket_vec;
+
+private:
+    Status process_build_block(Block& block);
+    FunctionBasePtr _hash_func;
+    FunctionBasePtr _mod_func;
 };
 } // namespace vectorized
 } // namespace doris

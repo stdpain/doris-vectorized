@@ -3,6 +3,8 @@
 #include "gen_cpp/PlanNodes_types.h"
 #include "vec/exprs/vexpr.h"
 #include "vec/exprs/vexpr_context.h"
+#include "vec/functions/simple_function_factory.h"
+#include "vec/utils/util.hpp"
 
 namespace doris::vectorized {
 // now we only support inner join
@@ -72,9 +74,51 @@ Status HashJoinNode::prepare(RuntimeState* state) {
         _build_tuple_idx.push_back(_row_descriptor.get_tuple_idx(build_tuple_desc->id()));
     }
 
-    // prepare for hash table
+    // right table data types
+    auto right_table_data_types = VectorizedUtils::get_data_types(child(1)->row_desc());
+    // Hash Table Init
+    _hash_table.reserve_size(1024);
+
+    DataTypes hash_table_value_types;
+    hash_table_value_types.reserve(right_table_data_types.size() + _build_expr_ctxs.size());
+    // TODO: for build expr, we don't have to generate new column if expr is slot reference
+
+    // make build expr value to first column
+    for (int32_t i = 0; i < _build_expr_ctxs.size(); ++i) {
+        hash_table_value_types.emplace_back(_build_expr_ctxs[i]->root()->data_type());
+    }
+    for (int32_t i = 0; i < right_table_data_types.size(); ++i) {
+        hash_table_value_types.emplace_back(std::move(right_table_data_types[i]));
+    }
+
+    _hash_table.init_values(std::move(hash_table_value_types));
+
+    // Some Function Init
+    auto data_type_i64 = std::make_shared<DataTypeInt64>();
+
+    ColumnsWithTypeAndName hash_func_params;
+    std::transform(_build_expr_ctxs.begin(), _build_expr_ctxs.end(),
+                   std::back_inserter(hash_func_params), [](auto& expr) -> ColumnWithTypeAndName {
+                       return {nullptr, expr->root()->data_type(), ""};
+                   });
+
+    const char* hash_func_name = "hash";
+    _hash_func = SimpleFunctionFactory::instance().get_function(hash_func_name, hash_func_params,
+                                                                data_type_i64);
+    LOG_IF(FATAL, (_hash_func == nullptr))
+            << fmt::format("couldn't found a function: {}", hash_func_name);
+
+    ColumnsWithTypeAndName mod_func_params = {{nullptr, data_type_i64, "hash_val"},
+                                              {nullptr, data_type_i64, "mod"}};
+
+    const char* mod_func_name = "mod";
+    _mod_func = SimpleFunctionFactory::instance().get_function(mod_func_name, mod_func_params,
+                                                               data_type_i64);
+    LOG_IF(FATAL, (_hash_func == nullptr))
+            << fmt::format("couldn't found a function: {}", mod_func_name);
     return Status::OK();
 }
+
 Status HashJoinNode::close(RuntimeState* state) {
     if (is_closed()) {
         return Status::OK();
@@ -106,15 +150,31 @@ Status HashJoinNode::open(RuntimeState* state) {
 
 Status HashJoinNode::hash_table_build(RuntimeState* state) {
     RETURN_IF_ERROR(child(1)->open(state));
-
     SCOPED_TIMER(_build_timer);
     Block block;
+
     while (true) {
         block.clear();
         RETURN_IF_CANCELLED(state);
         bool eos = true;
         RETURN_IF_ERROR(child(1)->get_next(state, &block, &eos));
+        RETURN_IF_ERROR(process_build_block(block));
     }
+    return Status::OK();
+}
+
+Status HashJoinNode::process_build_block(Block& block) {
+    // process block
+    size_t rows = block.rows();
+    _group_id_vec.resize(rows);
+    _bucket_vec.resize(rows);
+    // cacaulate hashValueV
+    size_t build_columns = _build_expr_ctxs.size();
+    for (size_t i = 0; i < build_columns; ++i) {
+    }
+    // modulo hash value to acqure bucket
+
+    _hash_table.insert(_group_id_vec, _bucket_vec, rows);
     return Status::OK();
 }
 
