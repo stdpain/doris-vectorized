@@ -39,6 +39,13 @@ private:
     std::vector<int> _build_tuple_idx;
 
     RuntimeProfile::Counter* _build_timer;
+    RuntimeProfile::Counter* _build_table_timer;
+    RuntimeProfile::Counter* _build_hash_calc_timer;
+    RuntimeProfile::Counter* _build_bucket_calc_timer;
+    RuntimeProfile::Counter* _build_expr_call_timer;
+    RuntimeProfile::Counter* _build_table_insert_timer;
+    RuntimeProfile::Counter* _build_table_spread_timer;
+    RuntimeProfile::Counter* _build_acquire_block_timer;
     RuntimeProfile::Counter* _probe_timer;
     RuntimeProfile::Counter* _build_buckets_counter;
 
@@ -59,9 +66,17 @@ private:
 
     GroupIdV _group_id_vec;
     BucketV _bucket_vec;
+    ColumnNumbers _build_column_numbers;
+    Columns _build_columns;
+
+    using BlockList = std::vector<Block>;
+    BlockList _block_list;
+    int64_t _hash_table_rows;
 
 private:
-    Status process_build_block(Block& block);
+    Status _process_build_blocks();
+    Status _process_build_block(Block& block);
+    Status _acquire_block(Block& block);
     FunctionBasePtr _hash_func;
     FunctionBasePtr _mod_func;
 };

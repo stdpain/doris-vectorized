@@ -9,7 +9,7 @@
 namespace doris::vectorized {
 // now we only support inner join
 HashJoinNode::HashJoinNode(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs)
-        : ExecNode(pool, tnode, descs) {}
+        : ExecNode(pool, tnode, descs), _hash_table_rows(0) {}
 
 HashJoinNode::~HashJoinNode() {}
 
@@ -46,13 +46,27 @@ Status HashJoinNode::init(const TPlanNode& tnode, RuntimeState* state) {
 
 Status HashJoinNode::prepare(RuntimeState* state) {
     RETURN_IF_ERROR(ExecNode::prepare(state));
-    _build_timer = ADD_TIMER(runtime_profile(), "BuildTime");
+    // Build phase
+    auto build_phase_profile = runtime_profile()->create_child("BuildPhase", true, true);
+    runtime_profile()->add_child(build_phase_profile, false, nullptr);
+    _build_timer = ADD_TIMER(build_phase_profile, "BuildTime");
+    _build_table_timer = ADD_TIMER(build_phase_profile, "BuildTableTime");
+    _build_hash_calc_timer = ADD_TIMER(build_phase_profile, "BuildHashCalcTime");
+    _build_bucket_calc_timer = ADD_TIMER(build_phase_profile, "BuildBucketCalcTime");
+    _build_expr_call_timer = ADD_TIMER(build_phase_profile, "BuildExprCallTime");
+    _build_table_insert_timer = ADD_TIMER(build_phase_profile, "BuildTableInsertTime");
+    _build_table_spread_timer = ADD_TIMER(build_phase_profile, "BuildTableSpreadTime");
+    _build_acquire_block_timer = ADD_TIMER(build_phase_profile, "BuildAcquireBlockTime");
+    _build_rows_counter = ADD_COUNTER(build_phase_profile, "BuildRows", TUnit::UNIT);
+
     _push_down_timer = ADD_TIMER(runtime_profile(), "PushDownTime");
     _push_compute_timer = ADD_TIMER(runtime_profile(), "PushDownComputeTime");
-    _probe_timer = ADD_TIMER(runtime_profile(), "ProbeTime");
-    _build_rows_counter = ADD_COUNTER(runtime_profile(), "BuildRows", TUnit::UNIT);
+
+    // Probe phase
+    auto probe_phase_profile = runtime_profile()->create_child("ProbePhase", true, true);
+    _probe_timer = ADD_TIMER(probe_phase_profile, "ProbeTime");
+    _probe_rows_counter = ADD_COUNTER(probe_phase_profile, "ProbeRows", TUnit::UNIT);
     _build_buckets_counter = ADD_COUNTER(runtime_profile(), "BuildBuckets", TUnit::UNIT);
-    _probe_rows_counter = ADD_COUNTER(runtime_profile(), "ProbeRows", TUnit::UNIT);
     _hash_tbl_load_factor_counter =
             ADD_COUNTER(runtime_profile(), "LoadFactor", TUnit::DOUBLE_VALUE);
 
@@ -77,7 +91,6 @@ Status HashJoinNode::prepare(RuntimeState* state) {
     // right table data types
     auto right_table_data_types = VectorizedUtils::get_data_types(child(1)->row_desc());
     // Hash Table Init
-    _hash_table.reserve_size(1024);
 
     DataTypes hash_table_value_types;
     hash_table_value_types.reserve(right_table_data_types.size() + _build_expr_ctxs.size());
@@ -92,9 +105,11 @@ Status HashJoinNode::prepare(RuntimeState* state) {
     }
 
     _hash_table.init_values(std::move(hash_table_value_types));
+    // reserve hash table size
+    _hash_table.reserve_size(8388608);
 
     // Some Function Init
-    auto data_type_i64 = std::make_shared<DataTypeInt64>();
+    auto data_type_u64 = std::make_shared<DataTypeUInt64>();
 
     ColumnsWithTypeAndName hash_func_params;
     std::transform(_build_expr_ctxs.begin(), _build_expr_ctxs.end(),
@@ -102,18 +117,18 @@ Status HashJoinNode::prepare(RuntimeState* state) {
                        return {nullptr, expr->root()->data_type(), ""};
                    });
 
-    const char* hash_func_name = "hash";
+    const char* hash_func_name = "murmurHash2_64";
     _hash_func = SimpleFunctionFactory::instance().get_function(hash_func_name, hash_func_params,
-                                                                data_type_i64);
+                                                                data_type_u64);
     LOG_IF(FATAL, (_hash_func == nullptr))
             << fmt::format("couldn't found a function: {}", hash_func_name);
 
-    ColumnsWithTypeAndName mod_func_params = {{nullptr, data_type_i64, "hash_val"},
-                                              {nullptr, data_type_i64, "mod"}};
+    ColumnsWithTypeAndName mod_func_params = {{nullptr, data_type_u64, "hash_val"},
+                                              {nullptr, data_type_u64, "mod"}};
 
     const char* mod_func_name = "mod";
     _mod_func = SimpleFunctionFactory::instance().get_function(mod_func_name, mod_func_params,
-                                                               data_type_i64);
+                                                               data_type_u64);
     LOG_IF(FATAL, (_hash_func == nullptr))
             << fmt::format("couldn't found a function: {}", mod_func_name);
     return Status::OK();
@@ -130,7 +145,9 @@ Status HashJoinNode::get_next(RuntimeState* state, RowBatch* row_batch, bool* eo
     return Status::NotSupported("Not Implemented Aggregation Node::get_next scalar");
 }
 Status HashJoinNode::get_next(RuntimeState* state, Block* block, bool* eos) {
-    return Status::NotSupported("Not Implemented Aggregation Node::get_next vectorized");
+    block->clear();
+    *eos = true;
+    return Status::OK();
 }
 
 Status HashJoinNode::open(RuntimeState* state) {
@@ -153,29 +170,92 @@ Status HashJoinNode::hash_table_build(RuntimeState* state) {
     SCOPED_TIMER(_build_timer);
     Block block;
 
-    while (true) {
+    bool eos = false;
+    while (!eos) {
         block.clear();
         RETURN_IF_CANCELLED(state);
-        bool eos = true;
         RETURN_IF_ERROR(child(1)->get_next(state, &block, &eos));
-        RETURN_IF_ERROR(process_build_block(block));
+        RETURN_IF_ERROR(_acquire_block(block));
+    }
+    RETURN_IF_ERROR(_process_build_blocks());
+    // RETURN_IF_ERROR(process_build_block(block));
+    return Status::OK();
+}
+
+Status HashJoinNode::_process_build_blocks() {
+    for (auto& block : _block_list) {
+        RETURN_IF_ERROR(_process_build_block(block));
+        // TODO release block
     }
     return Status::OK();
 }
 
-Status HashJoinNode::process_build_block(Block& block) {
+Status HashJoinNode::_process_build_block(Block& block) {
+    SCOPED_TIMER(_build_table_timer);
     // process block
     size_t rows = block.rows();
+    if (rows == 0) {
+        return Status::OK();
+    }
     _group_id_vec.resize(rows);
     _bucket_vec.resize(rows);
+
     // cacaulate hashValueV
-    size_t build_columns = _build_expr_ctxs.size();
-    for (size_t i = 0; i < build_columns; ++i) {
+    size_t build_column_sz = _build_expr_ctxs.size();
+    //
+    _build_column_numbers.resize(build_column_sz);
+
+    ColumnNumbers build_column_numbers(build_column_sz);
+    // Call Build Expr
+    {
+        SCOPED_TIMER(_build_expr_call_timer);
+        for (size_t i = 0; i < build_column_sz; ++i) {
+            int result_col_id = -1;
+            RETURN_IF_ERROR(_build_expr_ctxs[i]->execute(&block, &result_col_id));
+            build_column_numbers[i] = result_col_id;
+        }
+    }
+
+    int result_id = block.columns();
+    {
+        SCOPED_TIMER(_build_hash_calc_timer);
+        block.insert({nullptr, std::make_shared<DataTypeUInt64>(), "hash_val"});
+        _hash_func->execute(block, build_column_numbers, result_id, rows);
     }
     // modulo hash value to acqure bucket
+    auto hash_column = block.get_by_position(result_id).column;
+    auto& hash_val_data = assert_cast<const ColumnUInt64*>(hash_column.get())->get_data();
+    for (int i = 0; i < rows; ++i) {
+        _bucket_vec[i] = hash_val_data[i] & (_hash_table.bucket_size() - 1);
+    }
 
-    _hash_table.insert(_group_id_vec, _bucket_vec, rows);
+    // prepare
+    _build_columns.resize(_hash_table.data_types().size());
+    for (int i = 0; i < build_column_numbers.size(); ++i) {
+        _build_columns[i] = block.get_by_position(build_column_numbers[i]).column;
+    }
+    // assign map child(1) to here
+    for (int i = 0; i < _hash_table.data_types().size() - build_column_sz; ++i) {
+        _build_columns[i + build_column_sz] = block.get_by_position(i).column;
+    }
+    // Insert Hash Table
+    {
+        SCOPED_TIMER(_build_table_insert_timer);
+        _hash_table.insert(_group_id_vec, _bucket_vec, rows);
+        {
+            SCOPED_TIMER(_build_table_spread_timer);
+            _hash_table.spread(_group_id_vec, _build_columns, rows);
+        }
+    }
     return Status::OK();
 }
 
+Status HashJoinNode::_acquire_block(Block& block) {
+    SCOPED_TIMER(_build_acquire_block_timer);
+    size_t rows = block.rows();
+    _block_list.emplace_back(std::move(block));
+    _hash_table_rows += rows;
+    COUNTER_SET(_build_rows_counter, _hash_table_rows);
+    return Status::OK();
+}
 } // namespace doris::vectorized

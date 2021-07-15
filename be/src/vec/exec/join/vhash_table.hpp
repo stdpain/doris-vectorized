@@ -21,7 +21,6 @@ struct VectorizedHashTable {
     // before call insert reserve size must be called
     template <class GroupIdV, class BucketV>
     void insert(GroupIdV& groupIdV, BucketV& bucketV, int n) {
-        reserve_size(counter + n);
         for (int i = 0; i < n; i++) {
             groupIdV[i] = counter++;
             next[groupIdV[i]] = first[bucketV[i]];
@@ -30,14 +29,14 @@ struct VectorizedHashTable {
     }
 
     template <class GroupIdV>
-    void spread(GroupIdV& groupIdV, MutableColumns& inputValues, int n) {
+    void spread(GroupIdV& groupIdV, Columns& inputValues, int n) {
         for (int i = 0; i < values.size(); ++i) {
             _spread(groupIdV, inputValues[i], i, n);
         }
     }
 
     template <class GroupIdV>
-    void _spread(GroupIdV& groupIdV, MutableColumnPtr& value_column, int col, int n) {
+    void _spread(GroupIdV& groupIdV, ColumnPtr& value_column, int col, int n) {
         values[col]->insert_range_from(*value_column, 0, n);
     }
 
@@ -50,6 +49,8 @@ struct VectorizedHashTable {
         }
     }
 
+    const DataTypes& data_types() { return _data_types; }
+
     size_t counter;
     using Vec = std::vector<size_t>;
     Vec first;
@@ -61,6 +62,9 @@ private:
     void _reserve_size(size_t sz) {
         first.resize(sz);
         next.resize(sz);
+        for (int i = 0; i < values.size(); ++i) {
+            values[i]->reserve(sz);
+        }
     }
 
     static inline size_t round_up_to_power_of_two(size_t v) {
