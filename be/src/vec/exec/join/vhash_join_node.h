@@ -74,7 +74,6 @@ private:
     int64_t _hash_table_rows;
 
 private:
-    Status _process_build_blocks();
     Status _process_build_block(Block& block);
     Status _acquire_block(Block& block);
     FunctionBasePtr _hash_func;

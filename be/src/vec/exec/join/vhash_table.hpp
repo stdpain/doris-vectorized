@@ -16,6 +16,12 @@ struct VectorizedHashTable {
             values.emplace_back(type->create_column());
         }
         _data_types = std::move(data_types);
+
+        // increase counter to reserve space
+        ++counter;
+        for (int i = 0; i < values.size(); ++i) {
+            values[i]->insert_default();
+        }
     }
 
     // before call insert reserve size must be called
@@ -24,6 +30,7 @@ struct VectorizedHashTable {
         for (int i = 0; i < n; i++) {
             groupIdV[i] = counter++;
             next[groupIdV[i]] = first[bucketV[i]];
+            _bucket_filled_num += (first[bucketV[i]] == 0);
             first[bucketV[i]] = groupIdV[i];
         }
     }
@@ -42,11 +49,49 @@ struct VectorizedHashTable {
 
     size_t bucket_size() { return first.size(); }
 
+    size_t reserve_size() { return next.size(); }
+
     void reserve_size(size_t size) {
-        if (size > bucket_size()) {
+        if (size > reserve_size()) {
             size_t sz = round_up_to_power_of_two(size);
             _reserve_size(sz);
         }
+    }
+
+    void reserve_bucket() {
+        if (_bucket_filled_num <= _bucket_till_resize) {
+            size_t sz = bucket_size() * 2;
+            resize_bucket(sz);
+        }
+    }
+
+    void resize_bucket(size_t num_buckets) {
+        DCHECK_EQ((num_buckets & (num_buckets - 1)), 0);
+        int64_t old_num_buckets = bucket_size();
+
+        first.resize(num_buckets);
+
+        auto& hash_column = values[0];
+        auto& hash_val_data = assert_cast<const ColumnUInt64*>(hash_column.get())->get_data();
+        for (size_t i = 0; i < old_num_buckets; ++i) {
+            // hash table
+            auto group_id = first[i];
+            while (group_id) {
+                uint64_t hash = hash_val_data[group_id];
+                int32_t target_bucket = hash & (num_buckets - 1);
+                int64_t next_group_id = next[group_id];
+
+                if (target_bucket != i) {
+                    next[group_id] = first[target_bucket];
+                    first[target_bucket] = group_id;
+                    first[i] = next_group_id;
+                }
+
+                group_id = next_group_id;
+            }
+            _bucket_filled_num -= (first[i] == 0);
+        }
+        _bucket_till_resize = num_buckets * 0.75;
     }
 
     const DataTypes& data_types() { return _data_types; }
@@ -58,9 +103,11 @@ struct VectorizedHashTable {
     MutableColumns values;
     DataTypes _data_types;
 
+    size_t _bucket_filled_num;
+    size_t _bucket_till_resize;
+
 private:
     void _reserve_size(size_t sz) {
-        first.resize(sz);
         next.resize(sz);
         for (int i = 0; i < values.size(); ++i) {
             values[i]->reserve(sz);

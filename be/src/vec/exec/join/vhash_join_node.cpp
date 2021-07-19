@@ -1,6 +1,7 @@
 #include "vec/exec/join/vhash_join_node.h"
 
 #include "gen_cpp/PlanNodes_types.h"
+#include "util/defer_op.h"
 #include "vec/exprs/vexpr.h"
 #include "vec/exprs/vexpr_context.h"
 #include "vec/functions/simple_function_factory.h"
@@ -93,10 +94,12 @@ Status HashJoinNode::prepare(RuntimeState* state) {
     // Hash Table Init
 
     DataTypes hash_table_value_types;
-    hash_table_value_types.reserve(right_table_data_types.size() + _build_expr_ctxs.size());
+    hash_table_value_types.reserve(1 + _build_expr_ctxs.size() + right_table_data_types.size());
     // TODO: for build expr, we don't have to generate new column if expr is slot reference
 
-    // make build expr value to first column
+    // make hash val to first value column
+    hash_table_value_types.emplace_back(std::make_shared<DataTypeUInt64>());
+    // make build expr value to second value column
     for (int32_t i = 0; i < _build_expr_ctxs.size(); ++i) {
         hash_table_value_types.emplace_back(_build_expr_ctxs[i]->root()->data_type());
     }
@@ -106,8 +109,8 @@ Status HashJoinNode::prepare(RuntimeState* state) {
 
     _hash_table.init_values(std::move(hash_table_value_types));
     // reserve hash table size
-    _hash_table.reserve_size(8388608);
-
+    _hash_table.reserve_size(1024);
+    _hash_table.resize_bucket(1024);
     // Some Function Init
     auto data_type_u64 = std::make_shared<DataTypeUInt64>();
 
@@ -168,6 +171,8 @@ Status HashJoinNode::open(RuntimeState* state) {
 Status HashJoinNode::hash_table_build(RuntimeState* state) {
     RETURN_IF_ERROR(child(1)->open(state));
     SCOPED_TIMER(_build_timer);
+    Defer defer {
+            [&]() { COUNTER_SET(_build_buckets_counter, (int64_t)_hash_table.bucket_size()); }};
     Block block;
 
     bool eos = false;
@@ -175,17 +180,7 @@ Status HashJoinNode::hash_table_build(RuntimeState* state) {
         block.clear();
         RETURN_IF_CANCELLED(state);
         RETURN_IF_ERROR(child(1)->get_next(state, &block, &eos));
-        RETURN_IF_ERROR(_acquire_block(block));
-    }
-    RETURN_IF_ERROR(_process_build_blocks());
-    // RETURN_IF_ERROR(process_build_block(block));
-    return Status::OK();
-}
-
-Status HashJoinNode::_process_build_blocks() {
-    for (auto& block : _block_list) {
         RETURN_IF_ERROR(_process_build_block(block));
-        // TODO release block
     }
     return Status::OK();
 }
@@ -199,6 +194,9 @@ Status HashJoinNode::_process_build_block(Block& block) {
     }
     _group_id_vec.resize(rows);
     _bucket_vec.resize(rows);
+
+    _hash_table.reserve_size(_hash_table.counter + rows);
+    _hash_table.reserve_bucket();
 
     // cacaulate hashValueV
     size_t build_column_sz = _build_expr_ctxs.size();
@@ -231,12 +229,15 @@ Status HashJoinNode::_process_build_block(Block& block) {
 
     // prepare
     _build_columns.resize(_hash_table.data_types().size());
+    _build_columns[0] = hash_column;
+    int column_cnt = 1;
+
     for (int i = 0; i < build_column_numbers.size(); ++i) {
-        _build_columns[i] = block.get_by_position(build_column_numbers[i]).column;
+        _build_columns[column_cnt++] = block.get_by_position(build_column_numbers[i]).column;
     }
     // assign map child(1) to here
     for (int i = 0; i < _hash_table.data_types().size() - build_column_sz; ++i) {
-        _build_columns[i + build_column_sz] = block.get_by_position(i).column;
+        _build_columns[column_cnt++] = block.get_by_position(i).column;
     }
     // Insert Hash Table
     {
