@@ -147,9 +147,33 @@ Status HashJoinNode::close(RuntimeState* state) {
 Status HashJoinNode::get_next(RuntimeState* state, RowBatch* row_batch, bool* eos) {
     return Status::NotSupported("Not Implemented Aggregation Node::get_next scalar");
 }
-Status HashJoinNode::get_next(RuntimeState* state, Block* block, bool* eos) {
-    block->clear();
-    *eos = true;
+
+Status HashJoinNode::get_next(RuntimeState* state, Block* output_block, bool* eos) {
+    SCOPED_TIMER(_probe_timer);
+    output_block->clear();
+    Block block;
+    RETURN_IF_ERROR(child(0)->get_next(state, &block, eos));
+    int n = block.rows();
+    RETURN_IF_ERROR(_lookup_initial(block, _group_id_vec, _to_check_vec, n));
+    int m = n;
+    int column_sz = _build_expr_ctxs.size();
+
+    while (m > 0) {
+        for (int i = 0; i < column_sz; i++) {
+            auto value = block.get_by_position(_probe_column_numbers[i]).column;
+            // first column is hash value
+            _check_column(_differs_vec, _to_check_vec, _group_id_vec, _hash_table.values[1 + i],
+                          value, m);
+        }
+        m = _select_miss(_to_check_vec, _differs_vec, m);
+        find_next(_to_check_vec, _hash_table.next, _group_id_vec, m);
+        LOG(WARNING) << "===========:m" << m;
+    }
+
+    // block->clear();
+    // *eos = true;
+
+    // TODO gather
     return Status::OK();
 }
 
@@ -198,45 +222,19 @@ Status HashJoinNode::_process_build_block(Block& block) {
     _hash_table.reserve_size(_hash_table.counter + rows);
     _hash_table.reserve_bucket();
 
-    // cacaulate hashValueV
-    size_t build_column_sz = _build_expr_ctxs.size();
-    //
-    _build_column_numbers.resize(build_column_sz);
-
-    ColumnNumbers build_column_numbers(build_column_sz);
-    // Call Build Expr
-    {
-        SCOPED_TIMER(_build_expr_call_timer);
-        for (size_t i = 0; i < build_column_sz; ++i) {
-            int result_col_id = -1;
-            RETURN_IF_ERROR(_build_expr_ctxs[i]->execute(&block, &result_col_id));
-            build_column_numbers[i] = result_col_id;
-        }
-    }
-
-    int result_id = block.columns();
-    {
-        SCOPED_TIMER(_build_hash_calc_timer);
-        block.insert({nullptr, std::make_shared<DataTypeUInt64>(), "hash_val"});
-        _hash_func->execute(block, build_column_numbers, result_id, rows);
-    }
-    // modulo hash value to acqure bucket
-    auto hash_column = block.get_by_position(result_id).column;
-    auto& hash_val_data = assert_cast<const ColumnUInt64*>(hash_column.get())->get_data();
-    for (int i = 0; i < rows; ++i) {
-        _bucket_vec[i] = hash_val_data[i] & (_hash_table.bucket_size() - 1);
-    }
+    RETURN_IF_ERROR(_calc_hash(block, _build_expr_ctxs, _build_column_numbers, rows));
 
     // prepare
     _build_columns.resize(_hash_table.data_types().size());
-    _build_columns[0] = hash_column;
+    _build_columns[0] = _hash_column;
     int column_cnt = 1;
 
-    for (int i = 0; i < build_column_numbers.size(); ++i) {
-        _build_columns[column_cnt++] = block.get_by_position(build_column_numbers[i]).column;
+    for (int i = 0; i < _build_column_numbers.size(); ++i) {
+        _build_columns[column_cnt++] = block.get_by_position(_build_column_numbers[i]).column;
     }
     // assign map child(1) to here
-    for (int i = 0; i < _hash_table.data_types().size() - build_column_sz; ++i) {
+    int right_table_size = _hash_table.data_types().size() - _build_column_numbers.size() - 1;
+    for (int i = 0; i < right_table_size; ++i) {
         _build_columns[column_cnt++] = block.get_by_position(i).column;
     }
     // Insert Hash Table
@@ -258,5 +256,82 @@ Status HashJoinNode::_acquire_block(Block& block) {
     _hash_table_rows += rows;
     COUNTER_SET(_build_rows_counter, _hash_table_rows);
     return Status::OK();
+}
+
+Status HashJoinNode::_lookup_initial(Block& block, GroupIdV& groupIdV, CheckV& toCheckV, int n) {
+    groupIdV.resize(n);
+    toCheckV.resize(n);
+    _bucket_vec.resize(n);
+    _differs_vec.resize(n);
+
+    for (int i = 0; i < n; ++i) {
+        toCheckV[i] = i;
+    }
+
+    RETURN_IF_ERROR(_calc_hash(block, _probe_expr_ctxs, _probe_column_numbers, n));
+
+    for (int i = 0; i < n; ++i) {
+        groupIdV[i] = _hash_table.first[_bucket_vec[i]];
+    }
+
+    return Status::OK();
+}
+
+Status HashJoinNode::_calc_hash(Block& block, VExprContexts& input_expr,
+                                ColumnNumbers& input_column, int rows) {
+    size_t input_column_sz = input_expr.size();
+    //
+    input_column.resize(input_column_sz);
+
+    // Call Input Expr
+    {
+        SCOPED_TIMER(_build_expr_call_timer);
+        for (size_t i = 0; i < input_column_sz; ++i) {
+            int result_col_id = -1;
+            RETURN_IF_ERROR(_build_expr_ctxs[i]->execute(&block, &result_col_id));
+            input_column[i] = result_col_id;
+        }
+    }
+    // Execute Hash Function
+    int result_id = block.columns();
+    {
+        SCOPED_TIMER(_build_hash_calc_timer);
+        block.insert({nullptr, std::make_shared<DataTypeUInt64>(), "hash_val"});
+        RETURN_IF_ERROR(_hash_func->execute(block, input_column, result_id, rows));
+    }
+    // modulo hash value to acqure bucket
+    _hash_column = block.get_by_position(result_id).column;
+    auto& hash_val_data = assert_cast<const ColumnUInt64*>(_hash_column.get())->get_data();
+    for (int i = 0; i < rows; ++i) {
+        _bucket_vec[i] = hash_val_data[i] & (_hash_table.bucket_size() - 1);
+    }
+    return Status::OK();
+}
+
+void HashJoinNode::_check_column(DifferV& differV, CheckV& checkV, GroupIdV& groupV,
+                                 MutableColumnPtr& value, ColumnPtr& key, int m) {
+    const auto& probe_col = assert_cast<const ColumnInt32*>(key.get())->get_data();
+    const auto& build_col = assert_cast<const ColumnInt32*>(value.get())->get_data();
+    // group id
+    for (int i = 0; i < m; ++i) {
+        auto build_id = groupV[checkV[i]];
+        differV[i] = (build_col[build_id] == probe_col[checkV[i]]);
+    }
+}
+
+int HashJoinNode::_select_miss(CheckV& toCheckV, DifferV& differV, int m) {
+    int cnt = 0;
+    for (int i = 0; i < m; ++i) {
+        toCheckV[cnt] = toCheckV[i];
+        cnt += (differV[i] == 0);
+    }
+    return cnt;
+}
+
+void HashJoinNode::find_next(CheckV& toCheckV, Vec& next, GroupIdV& groupIdV, int m) {
+    for (int i = 0; i < m; ++i) {
+        auto build_id = groupIdV[toCheckV[i]];
+        groupIdV[toCheckV[i]] = next[build_id];
+    }
 }
 } // namespace doris::vectorized

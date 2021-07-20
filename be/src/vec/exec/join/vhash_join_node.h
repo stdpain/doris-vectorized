@@ -27,12 +27,13 @@ private:
     // TODO: make this thread not block
     Status hash_table_build(RuntimeState* state);
 
+    using VExprContexts = std::vector<VExprContext*>;
     // probe expr
-    std::vector<VExprContext*> _probe_expr_ctxs;
+    VExprContexts _probe_expr_ctxs;
     // build expr
-    std::vector<VExprContext*> _build_expr_ctxs;
+    VExprContexts _build_expr_ctxs;
     // other expr
-    std::vector<VExprContext*> _other_join_conjunct_ctxs;
+    VExprContexts _other_join_conjunct_ctxs;
 
     std::vector<bool> _is_null_safe_eq_join;
 
@@ -61,21 +62,47 @@ private:
 
     VectorizedHashTable _hash_table;
 
-    using GroupIdV = std::vector<size_t>;
-    using BucketV = std::vector<size_t>;
+    using Vec = std::vector<size_t>;
+    using GroupIdV = Vec;
+    using BucketV = Vec;
+    using CheckV = Vec;
+    using DifferV = Vec;
+    using VLength = size_t;
 
     GroupIdV _group_id_vec;
     BucketV _bucket_vec;
-    ColumnNumbers _build_column_numbers;
+    CheckV _to_check_vec;
+    DifferV _differs_vec;
+
     Columns _build_columns;
+    ColumnNumbers _build_column_numbers;
+    ColumnNumbers _probe_column_numbers;
 
     using BlockList = std::vector<Block>;
     BlockList _block_list;
     int64_t _hash_table_rows;
 
+    ColumnPtr _hash_column;
+
 private:
     Status _process_build_block(Block& block);
     Status _acquire_block(Block& block);
+
+    // use input expr as input
+    // output:
+    //  _bucket_vec
+    //  _calc_hash
+    Status _calc_hash(Block& block, VExprContexts& input_expr, ColumnNumbers& input_column,
+                      int rows);
+
+    Status _lookup_initial(Block& block, GroupIdV& groupIdV, CheckV& toCheckV, int n);
+
+    void _check_column(DifferV& differV, CheckV& checkV, GroupIdV& groupV, MutableColumnPtr& value,
+                       ColumnPtr& key, int m);
+
+    int _select_miss(CheckV& toCheckV, DifferV& differV, int m);
+
+    void find_next(CheckV& toCheckV, Vec& next, GroupIdV& groupIdV, int m);
     FunctionBasePtr _hash_func;
     FunctionBasePtr _mod_func;
 };
