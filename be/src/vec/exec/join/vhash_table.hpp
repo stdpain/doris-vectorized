@@ -59,7 +59,7 @@ struct VectorizedHashTable {
     }
 
     void reserve_bucket() {
-        if (_bucket_filled_num <= _bucket_till_resize) {
+        if (_bucket_filled_num >= _bucket_till_resize) {
             size_t sz = bucket_size() * 2;
             resize_bucket(sz);
         }
@@ -76,18 +76,22 @@ struct VectorizedHashTable {
         for (size_t i = 0; i < old_num_buckets; ++i) {
             // hash table
             auto group_id = first[i];
+            size_t* p_last = &first[i];
             while (group_id) {
                 uint64_t hash = hash_val_data[group_id];
                 int32_t target_bucket = hash & (num_buckets - 1);
-                int64_t next_group_id = next[group_id];
-
+                size_t next_group_id = next[group_id];
                 if (target_bucket != i) {
                     next[group_id] = first[target_bucket];
+                    _bucket_filled_num += (first[target_bucket] == 0);
                     first[target_bucket] = group_id;
-                    first[i] = next_group_id;
-                }
 
-                group_id = next_group_id;
+                    *p_last = next_group_id;
+                    group_id = next_group_id;
+                } else {
+                    p_last = &next[group_id];
+                    group_id = next_group_id;
+                }
             }
             _bucket_filled_num -= (first[i] == 0);
         }
@@ -103,8 +107,8 @@ struct VectorizedHashTable {
     MutableColumns values;
     DataTypes _data_types;
 
-    size_t _bucket_filled_num;
-    size_t _bucket_till_resize;
+    size_t _bucket_filled_num = 0;
+    size_t _bucket_till_resize = 0;
 
 private:
     void _reserve_size(size_t sz) {

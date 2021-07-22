@@ -39,6 +39,9 @@ private:
 
     std::vector<int> _build_tuple_idx;
 
+    DataTypes right_table_data_types;
+    DataTypes left_table_data_types;
+
     RuntimeProfile::Counter* _build_timer;
     RuntimeProfile::Counter* _build_table_timer;
     RuntimeProfile::Counter* _build_hash_calc_timer;
@@ -46,14 +49,23 @@ private:
     RuntimeProfile::Counter* _build_expr_call_timer;
     RuntimeProfile::Counter* _build_table_insert_timer;
     RuntimeProfile::Counter* _build_table_spread_timer;
+    RuntimeProfile::Counter* _build_table_expanse_timer;
     RuntimeProfile::Counter* _build_acquire_block_timer;
     RuntimeProfile::Counter* _probe_timer;
+    RuntimeProfile::Counter* _probe_expr_call_timer;
+    RuntimeProfile::Counter* _probe_hash_calc_timer;
+    RuntimeProfile::Counter* _probe_gather_timer;
+    RuntimeProfile::Counter* _probe_next_timer;
+    RuntimeProfile::Counter* _probe_select_miss_timer;
+    RuntimeProfile::Counter* _probe_select_zero_timer;
+    RuntimeProfile::Counter* _probe_diff_timer;
     RuntimeProfile::Counter* _build_buckets_counter;
 
     RuntimeProfile::Counter* _push_down_timer;
     RuntimeProfile::Counter* _push_compute_timer;
     RuntimeProfile::Counter* _build_rows_counter;
     RuntimeProfile::Counter* _probe_rows_counter;
+    RuntimeProfile::HighWaterMarkCounter* _probe_max_length;
 
     RuntimeProfile::Counter* _hash_tbl_load_factor_counter;
 
@@ -86,23 +98,29 @@ private:
 
 private:
     Status _process_build_block(Block& block);
-    Status _acquire_block(Block& block);
 
     // use input expr as input
     // output:
     //  _bucket_vec
     //  _calc_hash
     Status _calc_hash(Block& block, VExprContexts& input_expr, ColumnNumbers& input_column,
-                      int rows);
+                      int rows, RuntimeProfile::Counter* expr_timer,
+                      RuntimeProfile::Counter* hash_calc_timer);
 
     Status _lookup_initial(Block& block, GroupIdV& groupIdV, CheckV& toCheckV, int n);
 
     void _check_column(DifferV& differV, CheckV& checkV, GroupIdV& groupV, MutableColumnPtr& value,
                        ColumnPtr& key, int m);
 
-    int _select_miss(CheckV& toCheckV, DifferV& differV, int m);
+    int _select_miss(GroupIdV& groupV, CheckV& toCheckV, DifferV& differV, int m);
 
-    void find_next(CheckV& toCheckV, Vec& next, GroupIdV& groupIdV, int m);
+    int _select_notzero(GroupIdV& groupV, CheckV& toCheckV, int m);
+
+    void _find_next(CheckV& toCheckV, Vec& next, GroupIdV& groupIdV, int m);
+
+    // TODO: provide a iterator
+    void _gather(GroupIdV& groupV, CheckV& toCheckV, const Block& left_block,
+                 MutableBlock& output_mblock, int m);
     FunctionBasePtr _hash_func;
     FunctionBasePtr _mod_func;
 };
