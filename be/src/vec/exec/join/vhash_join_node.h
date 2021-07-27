@@ -4,6 +4,8 @@
 #include "vec/common/columns_hashing.h"
 #include "vec/common/hash_table/hash_map.h"
 #include "vec/common/hash_table/hash_table.h"
+#include "vec/exec/join/join_op.h"
+#include "vec/exec/join/vacquire_list.hpp"
 #include "vec/exec/join/vhash_table.hpp"
 #include "vec/functions/function.h"
 
@@ -23,10 +25,21 @@ struct PrimaryTypeValue {
     void inc() { value_sz++; }
 };
 
-using MappedAll = PrimaryTypeValue;
-using MapI32 = HashMap<UInt32, MappedAll, HashCRC32<UInt32>>;
+using I32Mapped = PrimaryTypeValue;
+using MapI32 = HashMap<UInt32, I32Mapped, HashCRC32<UInt32>>;
 using I32KeyType =
-        ColumnsHashing::HashMethodOneNumber<MapI32::value_type, MappedAll, UInt32, false>;
+        ColumnsHashing::HashMethodOneNumber<MapI32::value_type, I32Mapped, UInt32, false>;
+
+struct HashTableContext {
+    using Mapped = RowRefList;
+    using HashTable = HashMap<StringRef, Mapped>;
+    using State = ColumnsHashing::HashMethodSerialized<typename HashTable::value_type, Mapped>;
+    HashTable hash_table;
+};
+
+struct HashTableVariants {
+    std::unique_ptr<HashTableContext> serialized;
+};
 
 class VExprContext;
 
@@ -116,6 +129,8 @@ private:
     Status _process_build_block(Block& block);
     std::unique_ptr<MapI32> _hash_table;
     Arena _arena;
+    HashTableVariants _hash_table_variants;
+    AcquireList<Block> _acquire_list;
 };
 } // namespace vectorized
 } // namespace doris

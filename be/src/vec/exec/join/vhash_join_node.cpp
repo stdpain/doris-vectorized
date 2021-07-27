@@ -102,14 +102,7 @@ Status HashJoinNode::prepare(RuntimeState* state) {
     left_table_data_types = VectorizedUtils::get_data_types(child(0)->row_desc());
     // Hash Table Init
 
-    // _hash_table.reset(new MapI32(8388608));
-    // _hash_table.reset(new MapI32(2097152));
-    // _hash_table.reset(new MapI32(4096));
-    // _hash_table.reset(new MapI32(4194304));
-
-    _hash_table.reset(new MapI32());
-    // _hash_table.reset(new MapI32(4194304));
-    LOG(WARNING) << "========= init bucket size :" << _hash_table->get_buffer_size_in_cells();
+    _hash_table_variants.serialized.reset(new HashTableContext());
     return Status::OK();
 }
 
@@ -149,8 +142,11 @@ Status HashJoinNode::get_next(RuntimeState* state, Block* output_block, bool* eo
         probe_columns[i] = probe_block.get_by_position(result_id).column.get();
     }
 
+    using HashTableCtxType = std::decay_t<decltype(*_hash_table_variants.serialized)>;
+    using KeyGetter = HashTableCtxType::State;
+    using Mapped = HashTableCtxType::Mapped;
     //
-    I32KeyType key_getter(probe_columns, sizes, nullptr);
+    KeyGetter key_getter(probe_columns, sizes, nullptr);
 
     // find and build block
     MutableBlock mutable_block(VectorizedUtils::create_empty_columnswithtypename(row_desc()));
@@ -163,12 +159,17 @@ Status HashJoinNode::get_next(RuntimeState* state, Block* output_block, bool* eo
     int current_offset = 0;
 
     for (size_t i = 0; i < rows; ++i) {
-        auto find_result = key_getter.find_key(*_hash_table, i, _arena);
+        auto find_result =
+                key_getter.find_key(_hash_table_variants.serialized->hash_table, i, _arena);
         if (find_result.is_found()) {
             auto& mapped = find_result.get_mapped();
-            current_offset += mapped.value_sz;
-            for (int j = 0; j < mapped.value_sz; ++j) {
-                dst_col.push_back(key_getter.get_key_holder(i, _arena));
+
+            for (auto it = mapped.begin(); it.ok(); ++it) {
+                for (size_t j = 0, size = right_table_data_types.size(); j < size; ++j) {
+                    mcol[j + right_col_idx]->insert_from(*it->block->get_by_position(j).column,
+                                                         it->row_num);
+                }
+                ++current_offset;
             }
         }
 
@@ -226,29 +227,37 @@ Status HashJoinNode::_process_build_block(Block& block) {
         return Status::OK();
     }
 
+    auto& acquired_block = _acquire_list.acquire(std::move(block));
     ColumnRawPtrs raw_ptrs(1);
     for (size_t i = 0; i < _build_expr_ctxs.size(); ++i) {
         int result_col_id = -1;
-        RETURN_IF_ERROR(_build_expr_ctxs[i]->execute(&block, &result_col_id));
-        raw_ptrs[i] = block.get_by_position(result_col_id).column.get();
+        RETURN_IF_ERROR(_build_expr_ctxs[i]->execute(&acquired_block, &result_col_id));
+        raw_ptrs[i] = acquired_block.get_by_position(result_col_id).column.get();
     }
 
+    using HashTableCtxType = std::decay_t<decltype(*_hash_table_variants.serialized)>;
+    using KeyGetter = HashTableCtxType::State;
+    using Mapped = HashTableCtxType::Mapped;
     Sizes sizes(1);
-    I32KeyType key_getter(raw_ptrs, sizes, nullptr);
+
+    KeyGetter key_getter_(raw_ptrs, sizes, nullptr);
     // get_buffer_size_in_cells
-    auto& build_data = assert_cast<const ColumnInt32*>(raw_ptrs[0])->get_data();
+    // auto& build_data = assert_cast<const ColumnInt32*>(raw_ptrs[0])->get_data();
     Defer defer {[&]() {
-        COUNTER_SET(_build_buckets_counter, (int64_t)_hash_table->get_buffer_size_in_cells());
+        int64_t bucket_size =
+                _hash_table_variants.serialized->hash_table.get_buffer_size_in_cells();
+        COUNTER_SET(_build_buckets_counter, (int64_t)bucket_size);
     }};
     SCOPED_TIMER(_build_table_insert_timer);
-    for (int k = 0; k < rows; ++k) {
-        auto emplace_result = key_getter.emplace_key(*_hash_table, k, _arena);
+    for (size_t k = 0; k < rows; ++k) {
+        auto emplace_result_ =
+                key_getter_.emplace_key(_hash_table_variants.serialized->hash_table, k, _arena);
 
-        if (emplace_result.is_inserted()) {
-            new (&emplace_result.get_mapped()) MapI32::mapped_type(build_data[k]);
+        if (emplace_result_.is_inserted()) {
+            new (&emplace_result_.get_mapped()) Mapped({&acquired_block, k});
         } else {
             /// The first element of the list is stored in the value of the hash table, the rest in the pool.
-            emplace_result.get_mapped().inc();
+            emplace_result_.get_mapped().insert({&acquired_block, k}, _arena);
         }
     }
 
