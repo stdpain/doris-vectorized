@@ -1,11 +1,33 @@
 #pragma once
 #include "common/object_pool.h"
 #include "exec/exec_node.h"
+#include "vec/common/columns_hashing.h"
+#include "vec/common/hash_table/hash_map.h"
+#include "vec/common/hash_table/hash_table.h"
 #include "vec/exec/join/vhash_table.hpp"
 #include "vec/functions/function.h"
 
 namespace doris {
 namespace vectorized {
+
+struct PrimaryTypeValue {
+    /// Do not use size_t cause of memory economy
+    using SizeT = uint32_t;
+
+    SizeT value_sz = 1;
+
+    PrimaryTypeValue(int value_) {}
+
+    PrimaryTypeValue() {}
+
+    void inc() { value_sz++; }
+};
+
+using MappedAll = PrimaryTypeValue;
+using MapI32 = HashMap<UInt32, MappedAll, HashCRC32<UInt32>>;
+using I32KeyType =
+        ColumnsHashing::HashMethodOneNumber<MapI32::value_type, MappedAll, UInt32, false>;
+
 class VExprContext;
 
 class HashJoinNode : public ::doris::ExecNode {
@@ -21,8 +43,6 @@ public:
     virtual Status close(RuntimeState* state);
 
 private:
-    // TODO hash table
-    // TODO iterator
     // other join expr
     // TODO: make this thread not block
     Status hash_table_build(RuntimeState* state);
@@ -72,8 +92,6 @@ private:
     bool _build_unique;
     size_t _build_tuple_size;
 
-    VectorizedHashTable _hash_table;
-
     using Vec = std::vector<size_t>;
     using GroupIdV = Vec;
     using BucketV = Vec;
@@ -94,35 +112,10 @@ private:
     BlockList _block_list;
     int64_t _hash_table_rows;
 
-    ColumnPtr _hash_column;
-
 private:
     Status _process_build_block(Block& block);
-
-    // use input expr as input
-    // output:
-    //  _bucket_vec
-    //  _calc_hash
-    Status _calc_hash(Block& block, VExprContexts& input_expr, ColumnNumbers& input_column,
-                      int rows, RuntimeProfile::Counter* expr_timer,
-                      RuntimeProfile::Counter* hash_calc_timer);
-
-    Status _lookup_initial(Block& block, GroupIdV& groupIdV, CheckV& toCheckV, int n);
-
-    void _check_column(DifferV& differV, CheckV& checkV, GroupIdV& groupV, MutableColumnPtr& value,
-                       ColumnPtr& key, int m);
-
-    int _select_miss(GroupIdV& groupV, CheckV& toCheckV, DifferV& differV, int m);
-
-    int _select_notzero(GroupIdV& groupV, CheckV& toCheckV, int m);
-
-    void _find_next(CheckV& toCheckV, Vec& next, GroupIdV& groupIdV, int m);
-
-    // TODO: provide a iterator
-    void _gather(GroupIdV& groupV, CheckV& toCheckV, const Block& left_block,
-                 MutableBlock& output_mblock, int m);
-    FunctionBasePtr _hash_func;
-    FunctionBasePtr _mod_func;
+    std::unique_ptr<MapI32> _hash_table;
+    Arena _arena;
 };
 } // namespace vectorized
 } // namespace doris

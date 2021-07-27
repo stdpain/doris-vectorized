@@ -102,51 +102,14 @@ Status HashJoinNode::prepare(RuntimeState* state) {
     left_table_data_types = VectorizedUtils::get_data_types(child(0)->row_desc());
     // Hash Table Init
 
-    DataTypes hash_table_value_types;
-    hash_table_value_types.reserve(1 + _build_expr_ctxs.size() + right_table_data_types.size());
-    // TODO: for build expr, we don't have to generate new column if expr is slot reference
+    // _hash_table.reset(new MapI32(8388608));
+    // _hash_table.reset(new MapI32(2097152));
+    // _hash_table.reset(new MapI32(4096));
+    // _hash_table.reset(new MapI32(4194304));
 
-    // make hash val to first value column
-    hash_table_value_types.emplace_back(std::make_shared<DataTypeUInt64>());
-    // make build expr value to second value column
-    for (int32_t i = 0; i < _build_expr_ctxs.size(); ++i) {
-        hash_table_value_types.emplace_back(_build_expr_ctxs[i]->root()->data_type());
-    }
-    for (int32_t i = 0; i < right_table_data_types.size(); ++i) {
-        hash_table_value_types.emplace_back(std::move(right_table_data_types[i]));
-    }
-
-    _hash_table.init_values(std::move(hash_table_value_types));
-    // reserve hash table size
-    // _hash_table.reserve_size(1024);
-    _hash_table.reserve_size(6001216);
-    // _hash_table.resize_bucket(1024);
-    // _hash_table.resize_bucket(1048576);
-    _hash_table.resize_bucket(2097152);
-
-    // Some Function Init
-    auto data_type_u64 = std::make_shared<DataTypeUInt64>();
-
-    ColumnsWithTypeAndName hash_func_params;
-    std::transform(_build_expr_ctxs.begin(), _build_expr_ctxs.end(),
-                   std::back_inserter(hash_func_params), [](auto& expr) -> ColumnWithTypeAndName {
-                       return {nullptr, expr->root()->data_type(), ""};
-                   });
-
-    const char* hash_func_name = "murmurHash2_64";
-    _hash_func = SimpleFunctionFactory::instance().get_function(hash_func_name, hash_func_params,
-                                                                data_type_u64);
-    LOG_IF(FATAL, (_hash_func == nullptr))
-            << fmt::format("couldn't found a function: {}", hash_func_name);
-
-    ColumnsWithTypeAndName mod_func_params = {{nullptr, data_type_u64, "hash_val"},
-                                              {nullptr, data_type_u64, "mod"}};
-
-    const char* mod_func_name = "mod";
-    _mod_func = SimpleFunctionFactory::instance().get_function(mod_func_name, mod_func_params,
-                                                               data_type_u64);
-    LOG_IF(FATAL, (_hash_func == nullptr))
-            << fmt::format("couldn't found a function: {}", mod_func_name);
+    _hash_table.reset(new MapI32());
+    // _hash_table.reset(new MapI32(4194304));
+    LOG(WARNING) << "========= init bucket size :" << _hash_table->get_buffer_size_in_cells();
     return Status::OK();
 }
 
@@ -161,44 +124,67 @@ Status HashJoinNode::get_next(RuntimeState* state, RowBatch* row_batch, bool* eo
     return Status::NotSupported("Not Implemented Aggregation Node::get_next scalar");
 }
 
+// TODO: got a iterator
 Status HashJoinNode::get_next(RuntimeState* state, Block* output_block, bool* eos) {
     SCOPED_TIMER(_runtime_profile->total_time_counter());
+    Block probe_block;
+    RETURN_IF_ERROR(child(0)->get_next(state, &probe_block, eos));
     SCOPED_TIMER(_probe_timer);
-    output_block->clear();
-    MutableBlock mutable_block(VectorizedUtils::create_empty_columnswithtypename(row_desc()));
-    Block block;
-    RETURN_IF_ERROR(child(0)->get_next(state, &block, eos));
-    int n = block.rows();
-    COUNTER_UPDATE(_probe_rows_counter, static_cast<int64_t>(n));
-    if (n == 0) {
+
+    size_t rows = probe_block.rows();
+    if (rows == 0) {
+        *eos = true;
         return Status::OK();
     }
-    RETURN_IF_ERROR(_lookup_initial(block, _group_id_vec, _to_check_vec, n));
-    int m = n;
-    int column_sz = _build_expr_ctxs.size();
 
-PROBE_TAG:
-    while (m > 0) {
-        for (int i = 0; i < column_sz; i++) {
-            auto value = block.get_by_position(_probe_column_numbers[i]).column;
-            // first column is hash value
-            _check_column(_differs_vec, _to_check_vec, _group_id_vec, _hash_table.values[1 + i],
-                          value, m);
-        }
-        m = _select_miss(_group_id_vec, _to_check_vec, _differs_vec, m);
-        _find_next(_to_check_vec, _hash_table.next, _group_id_vec, m);
+    // start probe
+    // prepare probe columns
+    Sizes sizes(1);
+    int probe_expr_ctxs_sz = _probe_expr_ctxs.size();
+    ColumnRawPtrs probe_columns(probe_expr_ctxs_sz);
+    for (int i = 0; i < probe_expr_ctxs_sz; ++i) {
+        int result_id = -1;
+        _probe_expr_ctxs[i]->execute(&probe_block, &result_id);
+        DCHECK_GE(result_id, 0);
+        probe_columns[i] = probe_block.get_by_position(result_id).column.get();
     }
-    m = _select_notzero(_group_id_vec, _to_check_vec, n);
+
+    //
+    I32KeyType key_getter(probe_columns, sizes, nullptr);
+
+    // find and build block
+    MutableBlock mutable_block(VectorizedUtils::create_empty_columnswithtypename(row_desc()));
+    output_block->clear();
+    IColumn::Offsets offset_data;
+    auto& mcol = mutable_block.mutable_columns();
+
+    int right_col_idx = left_table_data_types.size();
+    auto& dst_col = assert_cast<ColumnInt32*>(mcol[right_col_idx].get())->get_data();
+    int current_offset = 0;
+
+    for (size_t i = 0; i < rows; ++i) {
+        auto find_result = key_getter.find_key(*_hash_table, i, _arena);
+        if (find_result.is_found()) {
+            auto& mapped = find_result.get_mapped();
+            current_offset += mapped.value_sz;
+            for (int j = 0; j < mapped.value_sz; ++j) {
+                dst_col.push_back(key_getter.get_key_holder(i, _arena));
+            }
+        }
+
+        offset_data.push_back(current_offset);
+    }
+
+    output_block->swap(mutable_block.to_block());
+    for (int i = 0; i < right_col_idx; ++i) {
+        auto& column = probe_block.get_by_position(i).column;
+        output_block->get_by_position(i).column = column->replicate(offset_data);
+    }
+
+    int m = dst_col.size();
     COUNTER_UPDATE(_rows_returned_counter, static_cast<int64_t>(m));
     _num_rows_returned += m;
 
-    _gather(_group_id_vec, _to_check_vec, block, mutable_block, m);
-
-    if (m > 0) {
-        _find_next(_to_check_vec, _hash_table.next, _group_id_vec, m);
-        goto PROBE_TAG;
-    }
-    output_block->swap(mutable_block.to_block());
     return Status::OK();
 }
 
@@ -220,8 +206,6 @@ Status HashJoinNode::open(RuntimeState* state) {
 Status HashJoinNode::hash_table_build(RuntimeState* state) {
     RETURN_IF_ERROR(child(1)->open(state));
     SCOPED_TIMER(_build_timer);
-    Defer defer {
-            [&]() { COUNTER_SET(_build_buckets_counter, (int64_t)_hash_table.bucket_size()); }};
     Block block;
 
     bool eos = false;
@@ -241,171 +225,34 @@ Status HashJoinNode::_process_build_block(Block& block) {
     if (rows == 0) {
         return Status::OK();
     }
-    _group_id_vec.resize(rows);
-    _bucket_vec.resize(rows);
 
-    {
-        SCOPED_TIMER(_build_table_expanse_timer);
-        _hash_table.reserve_size(_hash_table.counter + rows);
-        _hash_table.reserve_bucket();
+    ColumnRawPtrs raw_ptrs(1);
+    for (size_t i = 0; i < _build_expr_ctxs.size(); ++i) {
+        int result_col_id = -1;
+        RETURN_IF_ERROR(_build_expr_ctxs[i]->execute(&block, &result_col_id));
+        raw_ptrs[i] = block.get_by_position(result_col_id).column.get();
     }
 
-    RETURN_IF_ERROR(_calc_hash(block, _build_expr_ctxs, _build_column_numbers, rows,
-                               _build_expr_call_timer, _build_hash_calc_timer));
+    Sizes sizes(1);
+    I32KeyType key_getter(raw_ptrs, sizes, nullptr);
+    // get_buffer_size_in_cells
+    auto& build_data = assert_cast<const ColumnInt32*>(raw_ptrs[0])->get_data();
+    Defer defer {[&]() {
+        COUNTER_SET(_build_buckets_counter, (int64_t)_hash_table->get_buffer_size_in_cells());
+    }};
+    SCOPED_TIMER(_build_table_insert_timer);
+    for (int k = 0; k < rows; ++k) {
+        auto emplace_result = key_getter.emplace_key(*_hash_table, k, _arena);
 
-    // prepare
-    _build_columns.resize(_hash_table.data_types().size());
-    _build_columns[0] = _hash_column;
-    int column_cnt = 1;
-
-    for (int i = 0; i < _build_column_numbers.size(); ++i) {
-        _build_columns[column_cnt++] = block.get_by_position(_build_column_numbers[i]).column;
-    }
-    // assign map child(1) to here
-    int right_table_size = _hash_table.data_types().size() - _build_column_numbers.size() - 1;
-    for (int i = 0; i < right_table_size; ++i) {
-        _build_columns[column_cnt++] = block.get_by_position(i).column;
-    }
-    // Insert Hash Table
-    {
-        SCOPED_TIMER(_build_table_insert_timer);
-        _hash_table.insert(_group_id_vec, _bucket_vec, rows);
-        {
-            SCOPED_TIMER(_build_table_spread_timer);
-            _hash_table.spread(_group_id_vec, _build_columns, rows);
+        if (emplace_result.is_inserted()) {
+            new (&emplace_result.get_mapped()) MapI32::mapped_type(build_data[k]);
+        } else {
+            /// The first element of the list is stored in the value of the hash table, the rest in the pool.
+            emplace_result.get_mapped().inc();
         }
-    }
-
-    _hash_table_rows += rows;
-    COUNTER_SET(_build_rows_counter, _hash_table_rows);
-    return Status::OK();
-}
-
-Status HashJoinNode::_lookup_initial(Block& block, GroupIdV& groupIdV, CheckV& toCheckV, int n) {
-    groupIdV.resize(n);
-    toCheckV.resize(n);
-    _bucket_vec.resize(n);
-    _differs_vec.resize(n);
-
-    for (int i = 0; i < n; ++i) {
-        toCheckV[i] = i;
-    }
-
-    RETURN_IF_ERROR(_calc_hash(block, _probe_expr_ctxs, _probe_column_numbers, n,
-                               _probe_expr_call_timer, _probe_hash_calc_timer));
-
-    for (int i = 0; i < n; ++i) {
-        groupIdV[i] = _hash_table.first[_bucket_vec[i]];
     }
 
     return Status::OK();
 }
 
-Status HashJoinNode::_calc_hash(Block& block, VExprContexts& input_expr,
-                                ColumnNumbers& input_column, int rows,
-                                RuntimeProfile::Counter* expr_timer,
-                                RuntimeProfile::Counter* hash_calc_timer) {
-    size_t input_column_sz = input_expr.size();
-    //
-    input_column.resize(input_column_sz);
-
-    // Call Input Expr
-    {
-        SCOPED_TIMER(expr_timer);
-        for (size_t i = 0; i < input_column_sz; ++i) {
-            int result_col_id = -1;
-            RETURN_IF_ERROR(_build_expr_ctxs[i]->execute(&block, &result_col_id));
-            input_column[i] = result_col_id;
-        }
-    }
-    // Execute Hash Function
-    int result_id = block.columns();
-    {
-        SCOPED_TIMER(hash_calc_timer);
-        block.insert({nullptr, std::make_shared<DataTypeUInt64>(), "hash_val"});
-        RETURN_IF_ERROR(_hash_func->execute(block, input_column, result_id, rows));
-    }
-    // modulo hash value to acqure bucket
-    _hash_column = block.get_by_position(result_id).column;
-    auto& hash_val_data = assert_cast<const ColumnUInt64*>(_hash_column.get())->get_data();
-    for (int i = 0; i < rows; ++i) {
-        _bucket_vec[i] = hash_val_data[i] & (_hash_table.bucket_size() - 1);
-    }
-    return Status::OK();
-}
-
-void HashJoinNode::_check_column(DifferV& differV, CheckV& checkV, GroupIdV& groupV,
-                                 MutableColumnPtr& value, ColumnPtr& key, int m) {
-    SCOPED_TIMER(_probe_diff_timer);
-    const auto& probe_col = assert_cast<const ColumnInt32*>(key.get())->get_data();
-    const auto& build_col = assert_cast<const ColumnInt32*>(value.get())->get_data();
-    // group id
-    for (int i = 0; i < m; ++i) {
-        auto build_id = groupV[checkV[i]];
-        differV[checkV[i]] = (build_col[build_id] == probe_col[checkV[i]]);
-    }
-}
-
-int HashJoinNode::_select_miss(GroupIdV& groupV, CheckV& toCheckV, DifferV& differV, int m) {
-    SCOPED_TIMER(_probe_select_miss_timer);
-    int cnt = 0;
-    for (int i = 0; i < m; ++i) {
-        toCheckV[cnt] = toCheckV[i];
-        cnt += (differV[toCheckV[i]] == 0 && groupV[toCheckV[cnt]] != 0);
-    }
-    return cnt;
-}
-
-int HashJoinNode::_select_notzero(GroupIdV& groupV, CheckV& toCheckV, int m) {
-    SCOPED_TIMER(_probe_select_zero_timer);
-    int cnt = 0;
-    for (int i = 0; i < m; ++i) {
-        toCheckV[cnt] = i;
-        cnt += (groupV[toCheckV[cnt]] != 0);
-    }
-    return cnt;
-}
-
-void HashJoinNode::_find_next(CheckV& toCheckV, Vec& next, GroupIdV& groupIdV, int m) {
-    SCOPED_TIMER(_probe_next_timer);
-    for (int i = 0; i < m; ++i) {
-        auto build_id = groupIdV[toCheckV[i]];
-        groupIdV[toCheckV[i]] = next[build_id];
-    }
-}
-
-void HashJoinNode::_gather(GroupIdV& groupV, CheckV& toCheckV, const Block& left_block,
-                           MutableBlock& output_mblock, int m) {
-    SCOPED_TIMER(_probe_gather_timer);
-    // select vector
-    int cnt = 0;
-    for (int i = 0; i < left_table_data_types.size(); ++i) {
-        auto& ccol = left_block.get_by_position(i).column;
-        auto& mcol = output_mblock.mutable_columns()[cnt++];
-        auto src_vec_i32 = assert_cast<const ColumnInt32*>(ccol.get());
-        auto dst_vec_i32 = assert_cast<ColumnInt32*>(mcol.get());
-
-        auto& pod_src_vec = src_vec_i32->get_data();
-        auto& pod_dst_vec = dst_vec_i32->get_data();
-        pod_dst_vec.reserve(pod_dst_vec.size() + m);
-        for (int j = 0; j < m; ++j) {
-            pod_dst_vec.push_back(pod_src_vec[toCheckV[i]]);
-        }
-    }
-
-    for (int i = 0; i < right_table_data_types.size(); ++i) {
-        auto& ccol = _hash_table.values[i + 1 + _build_expr_ctxs.size()];
-        auto& mcol = output_mblock.mutable_columns()[cnt++];
-
-        auto src_vec_i32 = assert_cast<const ColumnInt32*>(ccol.get());
-        auto dst_vec_i32 = assert_cast<ColumnInt32*>(mcol.get());
-
-        auto& pod_src_vec = src_vec_i32->get_data();
-        auto& pod_dst_vec = dst_vec_i32->get_data();
-        pod_dst_vec.reserve(pod_dst_vec.size() + m);
-        for (int j = 0; j < m; ++j) {
-            pod_dst_vec.push_back(pod_src_vec[groupV[toCheckV[i]]]);
-        }
-    }
-}
 } // namespace doris::vectorized
