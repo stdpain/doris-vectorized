@@ -97,7 +97,7 @@ Status HashJoinNode::prepare(RuntimeState* state) {
     _left_table_data_types = VectorizedUtils::get_data_types(child(0)->row_desc());
     // Hash Table Init
 
-    _hash_table_variants.serialized.reset(new HashTableContext());
+    _hash_table_variants.emplace<SerializedHashTableContext>();
     return Status::OK();
 }
 
@@ -112,11 +112,9 @@ Status HashJoinNode::get_next(RuntimeState* state, RowBatch* row_batch, bool* eo
     return Status::NotSupported("Not Implemented HashJoin Node::get_next scalar");
 }
 
-// TODO: got a iterator
 Status HashJoinNode::get_next(RuntimeState* state, Block* output_block, bool* eos) {
     SCOPED_TIMER(_runtime_profile->total_time_counter());
     SCOPED_TIMER(_probe_timer);
-
     size_t probe_rows = _probe_block.rows();
     if (probe_rows == 0 || _probe_index == probe_rows) {
         _probe_index = 0;
@@ -140,60 +138,67 @@ Status HashJoinNode::get_next(RuntimeState* state, Block* output_block, bool* eo
         }
     }
 
-    // start probe
-    // prepare probe columns
-    Sizes sizes(1);
+    std::visit(
+            [&](auto&& arg) {
+                using HashTableCtxType = std::decay_t<decltype(arg)>;
+                if constexpr (!std::is_same_v<HashTableCtxType, std::monostate>) {
+                    using KeyGetter = typename HashTableCtxType::State;
+                    using Mapped = typename HashTableCtxType::Mapped;
 
-    using HashTableCtxType = std::decay_t<decltype(*_hash_table_variants.serialized)>;
-    using KeyGetter = HashTableCtxType::State;
-    using Mapped = HashTableCtxType::Mapped;
-    //
-    KeyGetter key_getter(_probe_columns, sizes, nullptr);
+                    Sizes sizes(1);
+                    KeyGetter key_getter(_probe_columns, sizes, nullptr);
 
-    // find and build block
-    MutableBlock mutable_block(VectorizedUtils::create_empty_columnswithtypename(row_desc()));
-    output_block->clear();
-    IColumn::Offsets offset_data;
-    auto& mcol = mutable_block.mutable_columns();
-    offset_data.assign(probe_rows, (uint32_t)0);
+                    MutableBlock mutable_block(
+                            VectorizedUtils::create_empty_columnswithtypename(row_desc()));
+                    output_block->clear();
 
-    int right_col_idx = _left_table_data_types.size();
-    int current_offset = 0;
+                    IColumn::Offsets offset_data;
+                    auto& mcol = mutable_block.mutable_columns();
+                    offset_data.assign(probe_rows, (uint32_t)0);
 
-    for (; _probe_index < probe_rows; ++_probe_index) {
-        auto find_result = key_getter.find_key(_hash_table_variants.serialized->hash_table,
-                                               _probe_index, _arena);
-        if (find_result.is_found()) {
-            auto& mapped = find_result.get_mapped();
+                    int right_col_idx = _left_table_data_types.size();
+                    int current_offset = 0;
 
-            for (auto it = mapped.begin(); it.ok(); ++it) {
-                for (size_t j = 0, size = _right_table_data_types.size(); j < size; ++j) {
-                    mcol[j + right_col_idx]->insert_from(*it->block->get_by_position(j).column,
-                                                         it->row_num);
+                    for (; _probe_index < probe_rows; ++_probe_index) {
+                        auto find_result =
+                                key_getter.find_key(arg.hash_table, _probe_index, _arena);
+                        if (find_result.is_found()) {
+                            auto& mapped = find_result.get_mapped();
+
+                            for (auto it = mapped.begin(); it.ok(); ++it) {
+                                for (size_t j = 0, size = _right_table_data_types.size(); j < size;
+                                     ++j) {
+                                    auto& column = *it->block->get_by_position(j).column;
+                                    mcol[j + right_col_idx]->insert_from(column, it->row_num);
+                                }
+                                ++current_offset;
+                            }
+                        }
+
+                        offset_data[_probe_index] = current_offset;
+                        if (current_offset >= state->batch_size()) {
+                            break;
+                        }
+                    }
+
+                    for (int i = _probe_index; i < probe_rows; ++i) {
+                        offset_data[i] = current_offset;
+                    }
+
+                    output_block->swap(mutable_block.to_block());
+                    for (int i = 0; i < right_col_idx; ++i) {
+                        auto& column = _probe_block.get_by_position(i).column;
+                        output_block->get_by_position(i).column = column->replicate(offset_data);
+                    }
+
+                    int64_t m = output_block->rows();
+                    COUNTER_UPDATE(_rows_returned_counter, m);
+                    _num_rows_returned += m;
+                } else {
+                    LOG(FATAL) << "FATAL: uninited hash table";
                 }
-                ++current_offset;
-            }
-        }
-
-        offset_data[_probe_index] = current_offset;
-        if (current_offset >= state->batch_size()) {
-            break;
-        }
-    }
-
-    for (int i = _probe_index; i < probe_rows; ++i) {
-        offset_data[i] = current_offset;
-    }
-
-    output_block->swap(mutable_block.to_block());
-    for (int i = 0; i < right_col_idx; ++i) {
-        auto& column = _probe_block.get_by_position(i).column;
-        output_block->get_by_position(i).column = column->replicate(offset_data);
-    }
-
-    int64_t m = output_block->rows();
-    COUNTER_UPDATE(_rows_returned_counter, m);
-    _num_rows_returned += m;
+            },
+            _hash_table_variants);
 
     return Status::OK();
 }
@@ -208,13 +213,13 @@ Status HashJoinNode::open(RuntimeState* state) {
     RETURN_IF_ERROR(VExpr::open(_probe_expr_ctxs, state));
     RETURN_IF_ERROR(VExpr::open(_other_join_conjunct_ctxs, state));
 
-    RETURN_IF_ERROR(hash_table_build(state));
+    RETURN_IF_ERROR(_hash_table_build(state));
     RETURN_IF_ERROR(child(0)->open(state));
 
     return Status::OK();
 }
 
-Status HashJoinNode::hash_table_build(RuntimeState* state) {
+Status HashJoinNode::_hash_table_build(RuntimeState* state) {
     RETURN_IF_ERROR(child(1)->open(state));
     SCOPED_TIMER(_build_timer);
     Block block;
@@ -231,12 +236,10 @@ Status HashJoinNode::hash_table_build(RuntimeState* state) {
 
 Status HashJoinNode::_process_build_block(Block& block) {
     SCOPED_TIMER(_build_table_timer);
-    // process block
     size_t rows = block.rows();
     if (rows == 0) {
         return Status::OK();
     }
-
     auto& acquired_block = _acquire_list.acquire(std::move(block));
     ColumnRawPtrs raw_ptrs(1);
     for (size_t i = 0; i < _build_expr_ctxs.size(); ++i) {
@@ -245,30 +248,35 @@ Status HashJoinNode::_process_build_block(Block& block) {
         raw_ptrs[i] = acquired_block.get_by_position(result_col_id).column.get();
     }
 
-    using HashTableCtxType = std::decay_t<decltype(*_hash_table_variants.serialized)>;
-    using KeyGetter = HashTableCtxType::State;
-    using Mapped = HashTableCtxType::Mapped;
-    Sizes sizes(1);
+    std::visit(
+            [&](auto&& arg) {
+                using HashTableCtxType = std::decay_t<decltype(arg)>;
+                if constexpr (!std::is_same_v<HashTableCtxType, std::monostate>) {
+                    using KeyGetter = typename HashTableCtxType::State;
+                    using Mapped = typename HashTableCtxType::Mapped;
 
-    KeyGetter key_getter(raw_ptrs, sizes, nullptr);
-    // get_buffer_size_in_cells
-    Defer defer {[&]() {
-        int64_t bucket_size =
-                _hash_table_variants.serialized->hash_table.get_buffer_size_in_cells();
-        COUNTER_SET(_build_buckets_counter, (int64_t)bucket_size);
-    }};
-    SCOPED_TIMER(_build_table_insert_timer);
-    for (size_t k = 0; k < rows; ++k) {
-        auto emplace_result =
-                key_getter.emplace_key(_hash_table_variants.serialized->hash_table, k, _arena);
-
-        if (emplace_result.is_inserted()) {
-            new (&emplace_result.get_mapped()) Mapped({&acquired_block, k});
-        } else {
-            /// The first element of the list is stored in the value of the hash table, the rest in the pool.
-            emplace_result.get_mapped().insert({&acquired_block, k}, _arena);
-        }
-    }
+                    Sizes sizes(1);
+                    KeyGetter key_getter(raw_ptrs, sizes, nullptr);
+                    // get_buffer_size_in_cells
+                    Defer defer {[&]() {
+                        int64_t bucket_size = arg.hash_table.get_buffer_size_in_cells();
+                        COUNTER_SET(_build_buckets_counter, (int64_t)bucket_size);
+                    }};
+                    SCOPED_TIMER(_build_table_insert_timer);
+                    for (size_t k = 0; k < rows; ++k) {
+                        auto emplace_result = key_getter.emplace_key(arg.hash_table, k, _arena);
+                        if (emplace_result.is_inserted()) {
+                            new (&emplace_result.get_mapped()) Mapped({&acquired_block, k});
+                        } else {
+                            /// The first element of the list is stored in the value of the hash table, the rest in the pool.
+                            emplace_result.get_mapped().insert({&acquired_block, k}, _arena);
+                        }
+                    }
+                } else {
+                    LOG(FATAL) << "FATAL: uninited hash table";
+                }
+            },
+            _hash_table_variants);
 
     return Status::OK();
 }

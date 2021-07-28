@@ -1,4 +1,6 @@
 #pragma once
+#include <variant>
+
 #include "common/object_pool.h"
 #include "exec/exec_node.h"
 #include "vec/common/columns_hashing.h"
@@ -30,16 +32,22 @@ using MapI32 = HashMap<UInt32, I32Mapped, HashCRC32<UInt32>>;
 using I32KeyType =
         ColumnsHashing::HashMethodOneNumber<MapI32::value_type, I32Mapped, UInt32, false>;
 
-struct HashTableContext {
+struct SerializedHashTableContext {
     using Mapped = RowRefList;
     using HashTable = HashMap<StringRef, Mapped>;
     using State = ColumnsHashing::HashMethodSerialized<typename HashTable::value_type, Mapped>;
     HashTable hash_table;
 };
-
-struct HashTableVariants {
-    std::unique_ptr<HashTableContext> serialized;
+struct I32HashTableContext {
+    using Mapped = RowRefList;
+    using HashTable = HashMap<UInt32, Mapped, HashCRC32<UInt32>>;
+    using State = ColumnsHashing::HashMethodOneNumber<typename HashTable::value_type, Mapped,
+                                                      UInt32, false>;
+    HashTable hash_table;
 };
+
+using HashTableVariants =
+        std::variant<std::monostate, SerializedHashTableContext, I32HashTableContext>;
 
 class VExprContext;
 
@@ -56,10 +64,6 @@ public:
     virtual Status close(RuntimeState* state);
 
 private:
-    // other join expr
-    // TODO: make this thread not block
-    Status hash_table_build(RuntimeState* state);
-
     using VExprContexts = std::vector<VExprContext*>;
 
     TJoinOp::type _join_op;
@@ -112,6 +116,7 @@ private:
     int _probe_index;
 
 private:
+    Status _hash_table_build(RuntimeState* state);
     Status _process_build_block(Block& block);
 };
 } // namespace vectorized
