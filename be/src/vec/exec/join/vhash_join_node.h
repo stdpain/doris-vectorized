@@ -61,6 +61,8 @@ private:
     Status hash_table_build(RuntimeState* state);
 
     using VExprContexts = std::vector<VExprContext*>;
+
+    TJoinOp::type _join_op;
     // probe expr
     VExprContexts _probe_expr_ctxs;
     // build expr
@@ -70,10 +72,8 @@ private:
 
     std::vector<bool> _is_null_safe_eq_join;
 
-    std::vector<int> _build_tuple_idx;
-
-    DataTypes right_table_data_types;
-    DataTypes left_table_data_types;
+    DataTypes _right_table_data_types;
+    DataTypes _left_table_data_types;
 
     RuntimeProfile::Counter* _build_timer;
     RuntimeProfile::Counter* _build_table_timer;
@@ -98,39 +98,21 @@ private:
     RuntimeProfile::Counter* _push_compute_timer;
     RuntimeProfile::Counter* _build_rows_counter;
     RuntimeProfile::Counter* _probe_rows_counter;
-    RuntimeProfile::HighWaterMarkCounter* _probe_max_length;
-
-    RuntimeProfile::Counter* _hash_tbl_load_factor_counter;
 
     bool _build_unique;
-    size_t _build_tuple_size;
 
-    using Vec = std::vector<size_t>;
-    using GroupIdV = Vec;
-    using BucketV = Vec;
-    using CheckV = Vec;
-    using DifferV = Vec;
-    using VLength = size_t;
-
-    GroupIdV _group_id_vec;
-    BucketV _bucket_vec;
-    CheckV _to_check_vec;
-    DifferV _differs_vec;
-
-    Columns _build_columns;
-    ColumnNumbers _build_column_numbers;
-    ColumnNumbers _probe_column_numbers;
-
-    using BlockList = std::vector<Block>;
-    BlockList _block_list;
     int64_t _hash_table_rows;
 
-private:
-    Status _process_build_block(Block& block);
-    std::unique_ptr<MapI32> _hash_table;
     Arena _arena;
     HashTableVariants _hash_table_variants;
     AcquireList<Block> _acquire_list;
+
+    Block _probe_block;
+    ColumnRawPtrs _probe_columns;
+    int _probe_index;
+
+private:
+    Status _process_build_block(Block& block);
 };
 } // namespace vectorized
 } // namespace doris
